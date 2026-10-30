@@ -1,0 +1,52 @@
+# Equilibrate the nanograined aluminum model and write a restart file.
+
+clear
+units metal
+dimension 3
+boundary p p p
+atom_style atomic
+
+# Neighbor settings
+neighbor 3.0 bin
+neigh_modify every 1 delay 0 check yes
+
+# Simulation parameters
+variable temperature equal 300       # Equilibration temperature (K)
+variable seed equal 12345             # Random seed for initial velocities
+variable timestep equal 0.001         # Timestep (ps)
+variable equil_steps equal 10000      # Number of NPT equilibration steps
+
+variable tdamp equal 100*v_timestep   # Thermostat damping time (ps)
+variable pdamp equal 1000*v_timestep  # Barostat damping time (ps)
+
+timestep ${timestep}
+
+# Read the initial nanograined aluminum structure
+read_data Total_UNporeGNG.lmp
+
+# Aluminum EAM potential
+pair_style eam/alloy
+pair_coeff * * Al-2009.eam.alloy Al
+mass 1 26.98
+
+# Energy minimization
+min_style cg
+minimize 1.0e-6 1.0e-6 1000 1000
+
+# NPT equilibration at zero pressure
+reset_timestep 0
+velocity all create ${temperature} ${seed} rot yes dist gaussian
+
+fix equil all npt temp ${temperature} ${temperature} ${tdamp} iso 0.0 0.0 ${pdamp} drag 1.0
+
+thermo 100
+thermo_style custom step temp pxx pyy pzz lx ly lz etotal
+
+dump equil_dump all cfg ${equil_steps} fcc.Al.*.cfg mass type xs ys zs
+run ${equil_steps}
+
+unfix equil
+undump equil_dump
+
+# This file is read by shock.in
+write_restart restart.equil

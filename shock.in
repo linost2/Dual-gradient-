@@ -1,0 +1,116 @@
+# Shock loading of nanograined aluminum using a moving piston.
+# Run restart.in first to generate restart.equil.
+
+clear
+units metal
+dimension 3
+boundary p p p
+atom_style atomic
+
+read_restart restart.equil
+
+# Neighbor settings
+neighbor 3.0 bin
+neigh_modify every 1 delay 0 check yes
+
+# Simulation settings
+variable timestep equal 0.001       # Timestep (ps)
+variable piston_speed equal 10.0    # Piston velocity (A/ps)
+variable hold_steps equal 12000     # Shock-loading duration (steps)
+variable stay_steps equal 26000     # Post-shock relaxation duration (steps)
+
+variable Nevery equal 10            # Sampling interval
+variable Nrepeat equal 8            # Number of samples per average
+variable Nfreq equal 100            # Averaging output interval
+variable deltax equal 16.0          # Spatial bin width (A)
+variable dump_every equal 1000      # Atomic trajectory output interval (steps)
+
+timestep ${timestep}
+
+# The same EAM potential used during equilibration
+pair_style eam/alloy
+pair_coeff * * Al-2009.eam.alloy Al
+mass 1 26.98
+
+# Use a shrink-wrapped boundary along the shock direction (x)
+change_box all boundary s p p
+
+# Define the piston, mobile bulk, and analysis regions
+region piston block INF 5.0 INF INF INF INF units box
+region bulk block 5.0 INF INF INF INF INF units box
+region struc_analy block 500.0 550.0 INF INF INF INF units box
+
+group piston region piston
+group bulk region bulk
+group struc_analy region struc_analy
+
+velocity piston set 0.0 0.0 0.0
+
+# Initial bulk length and engineering strain along x
+variable L0 equal bound(bulk,xmax)-bound(bulk,xmin)
+variable L0_init equal ${L0}
+variable strain equal -(bound(bulk,xmax)-bound(bulk,xmin)-v_L0_init)/v_L0_init
+
+# Per-atom quantities used for stress and temperature profiles
+compute stress_atom bulk stress/atom NULL virial
+compute voronoi bulk voronoi/atom
+compute iden_p piston property/atom id
+compute iden_b bulk property/atom id
+compute bulk_vel bulk property/atom vx vy vz mass
+compute piston_vel piston property/atom vx vy vz mass
+
+# Transverse kinetic temperature estimate (y and z components)
+variable vy2 atom c_bulk_vel[2]*c_bulk_vel[2]*1.0e4
+variable vz2 atom c_bulk_vel[3]*c_bulk_vel[3]*1.0e4
+variable temp_trans atom (v_vy2+v_vz2)*1.623e-3
+
+# Per-atom pressure components, including the kinetic contribution
+variable pxx_atom atom -(c_stress_atom[1]-c_bulk_vel[4]*c_bulk_vel[1]*c_bulk_vel[1])/(c_voronoi[1]+1.0e-99)
+variable pyy_atom atom -(c_stress_atom[2]-c_bulk_vel[4]*c_bulk_vel[2]*c_bulk_vel[2])/(c_voronoi[1]+1.0e-99)
+variable pzz_atom atom -(c_stress_atom[3]-c_bulk_vel[4]*c_bulk_vel[3]*c_bulk_vel[3])/(c_voronoi[1]+1.0e-99)
+
+variable mean_pressure atom (v_pxx_atom+v_pyy_atom+v_pzz_atom)/3.0
+variable shear_pressure atom 0.5*(v_pxx_atom-0.5*(v_pyy_atom+v_pzz_atom))
+
+# Von Mises stress from the per-atom virial stress tensor
+variable mises_sq atom ((c_stress_atom[1]-c_stress_atom[2])^2+(c_stress_atom[2]-c_stress_atom[3])^2+(c_stress_atom[3]-c_stress_atom[1])^2)/6.0+c_stress_atom[4]^2+c_stress_atom[5]^2+c_stress_atom[6]^2
+variable mises atom sqrt(3.0*v_mises_sq)
+
+# Average stress and transverse temperature in the analysis region
+compute analysis_avg struc_analy reduce ave v_pxx_atom v_temp_trans
+fix analysis_profile struc_analy ave/time ${Nevery} ${Nrepeat} ${Nfreq} c_analysis_avg[1] c_analysis_avg[2] file sigma.profile
+
+# Bulk strain history
+fix strain_profile bulk ave/time ${Nevery} ${Nrepeat} ${Nfreq} v_strain file strain_bulk.profile
+
+# Spatial profiles across the full system
+compute bins all chunk/atom bin/2d x lower ${deltax} y lower ${deltax} units box
+fix spatial_profile all ave/chunk ${Nevery} ${Nrepeat} ${Nfreq} bins c_bulk_vel[1] c_piston_vel[1] v_mean_pressure v_pxx_atom v_shear_pressure v_mises v_temp_trans file whole.profile
+
+# Atomic trajectory
+dump trajectory all cfg ${dump_every} dump._*.cfg mass type xs ys zs id c_iden_p c_iden_b v_temp_trans v_pxx_atom v_mises v_shear_pressure v_mean_pressure
+
+thermo 1000
+thermo_style custom step temp pxx pyy pzz lx ly lz
+
+# Integrate the bulk and constrain the piston.
+fix integrate bulk nve
+fix piston_force piston setforce 0.0 0.0 0.0
+
+# The original protocol uses zero ramp and unload durations.
+# Therefore, the piston starts at the target velocity immediately.
+fix piston_move piston move linear ${piston_speed} 0.0 0.0 units box
+run ${hold_steps}
+
+# Stop the piston and remove it before post-shock relaxation.
+unfix piston_move
+unfix piston_force
+delete_atoms group piston compress no
+
+run ${stay_steps}
+
+# Output files:
+#   dump._*.cfg          Atomic configurations
+#   strain_bulk.profile  Bulk strain history
+#   sigma.profile        Mean stress and transverse temperature
+#   whole.profile        Spatially averaged profiles
